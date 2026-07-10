@@ -1,0 +1,882 @@
+"""Seiche configuration: the codified-judgment layer.
+
+Everything in this file is an *opinion* — weights, thresholds, episode dates,
+contract constants. The math lives in engines/; the judgment lives here so it
+can be tuned without touching engine code.
+
+v2 ("Deep Water") adds: market-stress series (The Tell), discount-window
+confession channel, primary-dealer warehouse, calendar-resonance engine,
+hydrophone network, turn barometer, playbook, backtest lab, alert rules.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DB_PATH = DATA_DIR / "seiche.sqlite"
+BRIEF_DIR = DATA_DIR / "briefs"
+
+USER_AGENT = "seiche/0.2 (open-source funding-stress monitor)"
+# FRED's CDN bot-detection (verified 2026-07-06): custom UAs like "seiche/0.1"
+# hang forever, and a Chrome UA over Python TLS gets tarpitted (JA3 mismatch).
+# The one profile that consistently passes is httpx's own default UA — so the
+# FRED collector sends NO custom User-Agent. Do not "fix" this by adding one.
+
+# ---------------------------------------------------------------------------
+# Series registry: everything the collectors pull, with cadence-aware TTLs.
+# freq: D=daily, W=weekly. ttl_minutes: how long a cached fetch stays fresh.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SeriesSpec:
+    mnemonic: str          # internal name
+    source: str            # fred | nyfed | ofr | fiscaldata | cftc
+    remote_id: str         # upstream identifier
+    label: str
+    unit: str
+    freq: str = "D"
+    ttl_minutes: int = 360
+    start: str = "2017-01-01"   # history start (pretrain series reach back decades)
+
+
+FRED_SERIES = [
+    SeriesSpec("WALCL", "fred", "WALCL", "Fed total assets (H.4.1)", "$M", "W", 720),
+    SeriesSpec("WRESBAL", "fred", "WRESBAL", "Reserve balances with Federal Reserve Banks", "$M", "W", 720),
+    SeriesSpec("WTREGEN", "fred", "WTREGEN", "Treasury General Account (weekly avg)", "$M", "W", 720),
+    SeriesSpec("RRPONTSYD", "fred", "RRPONTSYD", "ON RRP take-up", "$B", "D", 360),
+    SeriesSpec("IORB", "fred", "IORB", "Interest on reserve balances", "%", "D", 720),
+    SeriesSpec("IOER", "fred", "IOER", "Interest on excess reserves (pre-2021 splice leg)", "%", "D", 100000),
+    SeriesSpec("EFFR", "fred", "EFFR", "Effective federal funds rate", "%", "D", 360),
+    SeriesSpec("SOFR", "fred", "SOFR", "Secured overnight financing rate", "%", "D", 360),
+    SeriesSpec("GDP", "fred", "GDP", "Nominal GDP (SAAR)", "$B", "Q", 10080),
+    # Confession channel #2: banks borrowing at the discount window primary
+    # credit rate — an even stronger admission than the SRF (stigma priced in).
+    SeriesSpec("DISCOUNT_WINDOW", "fred", "WLCFLPCL", "Discount window primary credit (Wed level)", "$M", "W", 720),
+]
+
+# Market-priced stress (The Tell's price leg + Playbook outcomes) — all FRED,
+# all keyless, deliberately official series rather than scraping quote APIs
+# (Yahoo 429s, Stooq blocks bots — verified 2026-07-07; FRED is the honest
+# contract). Outcomes are expressed in native units (Δbp, %, index pts).
+MARKET_SERIES = [
+    SeriesSpec("VIX", "fred", "VIXCLS", "CBOE VIX index", "pts", "D", 360),
+    SeriesSpec("HY_OAS", "fred", "BAMLH0A0HYM2", "ICE BofA US High Yield OAS", "%", "D", 360),
+    SeriesSpec("IG_OAS", "fred", "BAMLC0A0CM", "ICE BofA US Corporate (IG) OAS", "%", "D", 360),
+    SeriesSpec("DGS2", "fred", "DGS2", "2y Treasury constant maturity yield", "%", "D", 360),
+    SeriesSpec("DGS10", "fred", "DGS10", "10y Treasury constant maturity yield", "%", "D", 360),
+    SeriesSpec("DGS30", "fred", "DGS30", "30y Treasury constant maturity yield", "%", "D", 360),
+    SeriesSpec("TB3M", "fred", "DTB3", "3-month T-bill secondary market rate", "%", "D", 360),
+    SeriesSpec("TB4W", "fred", "DTB4WK", "4-week T-bill secondary market rate", "%", "D", 360),
+    SeriesSpec("SP500", "fred", "SP500", "S&P 500 index", "pts", "D", 360),
+    SeriesSpec("NFCI", "fred", "NFCI", "Chicago Fed National Financial Conditions Index", "z", "W", 720),
+]
+
+# Global basins (v2): the dollar system is one connected body of water.
+# EUR basin from the ECB Data Portal (keyless CSV), UK from FRED's SONIA
+# mirror, channels from H.4.1 (swap lines, foreign official RRP) + the broad
+# dollar index. Basins we can NOT source keyless-and-reliable (Japan TONA,
+# China, Russia, African markets) are stated as out of scope, not faked —
+# the engine takes new basins here when a qualifying feed exists.
+ECB_SERIES = [
+    SeriesSpec("ESTR", "ecb", "EST/B.EU000A2X2A25.WT", "Euro short-term rate (€STR)", "%", "D", 360),
+]
+
+GLOBAL_FRED_SERIES = [
+    SeriesSpec("ECB_DFR", "fred", "ECBDFR", "ECB deposit facility rate", "%", "D", 720),
+    SeriesSpec("SONIA", "fred", "IUDSOIA", "SONIA (UK overnight rate)", "%", "D", 360),
+    SeriesSpec("SWAP_LINES", "fred", "SWPT", "Central bank liquidity swaps outstanding (H.4.1)", "$M", "W", 720),
+    SeriesSpec("DXY_BROAD", "fred", "DTWEXBGS", "Broad US dollar index", "idx", "D", 360),
+    SeriesSpec("FOREIGN_RRP", "fred", "WLRRAFOIAL", "Reverse repo with foreign official accounts", "$M", "W", 720),
+]
+
+BASIN_WINDOW_D = 120           # rolling window for cross-basin coupling
+BASIN_EDGE_MIN_ABS = 0.25      # min |lagged corr| for a cross-basin edge
+SWAP_LINE_OPS_N = 90           # NY Fed FX-swap operations to pull
+
+# India: CCIL serves HTML only and RBI DBIE presents a broken SSL chain
+# (probed 2026-07-07) — neither meets the keyless-reliable bar, so India
+# joins through the FX channel (FRED's official daily INR) with the rates
+# feed declared pending, not faked.
+INDIA_FRED_SERIES = [
+    SeriesSpec("INR", "fred", "DEXINUS", "Indian rupee per USD", "INR", "D", 360),
+]
+
+# ---------------------------------------------------------------------------
+# Transfer learning: funding stress predates SOFR. The TED spread (3M LIBOR −
+# 3M T-bill, 1986–2022 on FRED) is the same funding-spread abstraction in its
+# era's clothes — 2008, 2011, 2016 live in it. The ML Lab pretrains on
+# TED-era pops (down-weighted), then reports the transfer gain vs the
+# SOFR-only model honestly — including when there is none.
+# TEDRATE fetch unverified-live from the build container; fails loud.
+# ---------------------------------------------------------------------------
+
+PRETRAIN_FRED_SERIES = [
+    SeriesSpec("TED", "fred", "TEDRATE", "TED spread (3M LIBOR − 3M T-bill, discontinued 2022)",
+               "%", "D", 100000, start="1990-01-01"),
+]
+PRETRAIN_SPIKE_BP = 15.0    # TED-era pop threshold (TED runs wider than SOFR−IORB)
+PRETRAIN_WEIGHT = 0.30      # sample weight of a pretrain row vs a SOFR-era row
+PRETRAIN_CUTOFF = "2018-04-01"  # pretrain rows end where the SOFR era begins
+
+# Crypto: stablecoins are money market instruments now (USDT/USDC hold
+# $200B+ of T-bills); a peg break is a dollar-funding event and crypto is
+# the only dollar market open on weekends. DeFiLlama + Coinbase Exchange,
+# both keyless (verified 2026-07-07).
+CRYPTO_PRODUCTS = ["BTC-USD", "ETH-USD", "USDT-USD"]   # Coinbase daily candles
+CRYPTO_CANDLE_YEARS = 4
+CRYPTO_TTL_MIN = 240
+STABLE_TOP_N = 6               # stablecoins shown on the peg board
+PEG_DEV_FLAG_BP = 30.0         # |peg deviation| worth flagging
+STABLE_DRAIN_FLAG_PCT = -3.0   # 30d total-mcap change that reads as redemptions
+
+OFR_SERIES = [
+    # TGCR/BGCR are 404 on FRED's CSV endpoint — sourced from OFR instead.
+    SeriesSpec("BGCR", "ofr", "FNYR-BGCR-A", "Broad general collateral rate", "%", "D", 360),
+    SeriesSpec("TGCR", "ofr", "FNYR-TGCR-A", "Tri-party general collateral rate", "%", "D", 360),
+    SeriesSpec("DVP_VOL", "ofr", "REPO-DVP_TV_TOT-P", "DVP repo total volume (preliminary)", "$B", "D", 360),
+    SeriesSpec("TRI_VOL", "ofr", "REPO-TRI_TV_TOT-P", "Tri-party repo total volume (preliminary)", "$B", "D", 360),
+    SeriesSpec("DVP_RATE_OO", "ofr", "REPO-DVP_AR_OO-P", "DVP overnight/open avg rate", "%", "D", 360),
+    SeriesSpec("TRI_RATE_OO", "ofr", "REPO-TRI_AR_OO-P", "Tri-party overnight/open avg rate", "%", "D", 360),
+    SeriesSpec("MMF_TOT", "ofr", "MMF-MMF_TOT-M", "Money market fund total assets", "$B", "M", 10080),
+    SeriesSpec("MMF_REPO_FICC", "ofr", "MMF-MMF_RP_wFICC-M", "MMF repo with FICC (sponsored)", "$B", "M", 10080),
+    SeriesSpec("MMF_REPO_FED", "ofr", "MMF-MMF_RP_wFR-M", "MMF repo with the Fed (RRP)", "$B", "M", 10080),
+    SeriesSpec("MMF_REPO_TOT", "ofr", "MMF-MMF_RP_TOT-M", "MMF total repo lending", "$B", "M", 10080),
+]
+
+# NY Fed + FiscalData + CFTC are fetched through dedicated collectors
+# (structured payloads, not single series). TTLs below.
+NYFED_TTL_MIN = 240        # rates with percentiles, SRF ops
+FISCAL_TTL_MIN = 360       # daily TGA, auctions
+CFTC_TTL_MIN = 1440        # COT is weekly; daily check is plenty
+PD_TTL_MIN = 720           # primary dealer stats are weekly (Thu 4:15pm ET)
+
+# History starts. Extended in v2 so the Time Machine and backtests can replay
+# Sep-2019. (DTS covers TGA from 2019; auctions_query goes back decades.)
+FRED_START = "2017-01-01"
+NYFED_RATES_START = "2018-04-01"     # SOFR publication starts 2018-04
+TGA_START = "2019-01-01"
+AUCTIONS_START = "2018-01-01"
+CFTC_START = "2018-01-01"
+
+# NY Fed primary dealer stats: net outright positions, $M, weekly. The
+# no-seriesbreak endpoint (/api/pd/get/{keyid}.json) returns the full spliced
+# history (verified live 2026-07-07). Bills + coupon buckets = the dealer
+# "warehouse" — how much duration the street is already sitting on.
+PD_POSITION_SERIES = {
+    "PDPOSGS-B": "Bills",
+    "PDPOSGSC-L2": "Coupons <2y",
+    "PDPOSGSC-G2L3": "Coupons 2-3y",
+    "PDPOSGSC-G3L6": "Coupons 3-6y",
+    "PDPOSGSC-G6L7": "Coupons 6-7y",
+    "PDPOSGSC-G7L11": "Coupons 7-11y",
+    "PDPOSGSC-G11L21": "Coupons 11-21y",
+    "PDPOSGSC-G21": "Coupons >21y",
+}
+
+# Crypto series live in the same store/provenance envelope as everything else.
+CRYPTO_SERIES = [
+    SeriesSpec("BTC_USD", "crypto", "coinbase:BTC-USD", "Bitcoin (Coinbase daily close)", "$", "D", CRYPTO_TTL_MIN),
+    SeriesSpec("ETH_USD", "crypto", "coinbase:ETH-USD", "Ether (Coinbase daily close)", "$", "D", CRYPTO_TTL_MIN),
+    SeriesSpec("USDT_USD", "crypto", "coinbase:USDT-USD", "Tether/USD (the peg, daily close)", "$", "D", CRYPTO_TTL_MIN),
+    SeriesSpec("STABLE_TOTAL", "crypto", "defillama:total", "Total stablecoin circulation", "$B", "D", CRYPTO_TTL_MIN),
+]
+
+# The far ocean: BIS Data Portal (keyless SDMX-CSV, verified live 2026-07-10;
+# stats.bis.org/api/v2). The DBnomics mirror of the same data ran ~4 quarters
+# behind BIS direct on probe day — BIS is primary, no mirror fallback (fail
+# loud instead of serving stale). remote_id = {dataflow}/{version}/{key}.
+BIS_SERIES = [
+    SeriesSpec("GLI_OFFSHORE_USD", "bis", "WS_GLI/1.0/Q.USD.3P.N.A.I.B.USD",
+               "USD credit to non-banks outside the US (BIS GLI)", "$M", "QL", 10080, start="2000-01-01"),
+    SeriesSpec("GLI_OFFSHORE_LOANS", "bis", "WS_GLI/1.0/Q.USD.3P.N.B.I.G.USD",
+               "USD bank loans to non-banks outside the US", "$M", "QL", 10080, start="2000-01-01"),
+    SeriesSpec("GLI_OFFSHORE_DEBT", "bis", "WS_GLI/1.0/Q.USD.3P.N.A.I.D.USD",
+               "USD debt securities of non-banks outside the US", "$M", "QL", 10080, start="2000-01-01"),
+    SeriesSpec("GLI_EME_USD", "bis", "WS_GLI/1.0/Q.USD.4T.N.A.I.B.USD",
+               "USD credit to non-banks in EMEs (BIS GLI)", "$M", "QL", 10080, start="2000-01-01"),
+    SeriesSpec("CREDIT_GAP_US", "bis", "WS_CREDIT_GAP/1.0/Q.US.P.A.C",
+               "US credit-to-GDP gap (actual − HP trend)", "pp", "QL", 10080, start="2000-01-01"),
+    SeriesSpec("CREDIT_GAP_CN", "bis", "WS_CREDIT_GAP/1.0/Q.CN.P.A.C",
+               "China credit-to-GDP gap (actual − HP trend)", "pp", "QL", 10080, start="2000-01-01"),
+]
+
+ALL_SERIES: dict[str, SeriesSpec] = {
+    s.mnemonic: s
+    for s in FRED_SERIES + MARKET_SERIES + GLOBAL_FRED_SERIES + INDIA_FRED_SERIES
+    + PRETRAIN_FRED_SERIES + OFR_SERIES + ECB_SERIES + CRYPTO_SERIES + BIS_SERIES
+}
+# PALIMPSEST_SERIES are appended to ALL_SERIES after their definition below
+# (they are declared later in the file to keep the Far Basin block coherent).
+
+# ---------------------------------------------------------------------------
+# Staleness classification (fail-loud provenance).
+# Age is measured against the series' expected cadence.
+# ---------------------------------------------------------------------------
+
+STALENESS_GRACE_DAYS = {"D": 4, "W": 10, "M": 45, "Q": 120, "QL": 300}
+# QL = lagged-quarterly: BIS publishes GLI/credit-gap statistics roughly two
+# quarters after the reference period BY DESIGN — a 9-month-old observation is
+# the current print, not a collector failure.
+
+# ---------------------------------------------------------------------------
+# Episode library for the Echo Engine: date the stress *peaked/broke*.
+# The engine matches today's trajectory against windows ENDING `lead` days
+# before each episode date. Also reused by the backtest lab's event studies.
+# ---------------------------------------------------------------------------
+
+EPISODES = {
+    "2019-09-17": "Sep 2019 repo spike (SOFR 5.25%, GC 10%)",
+    "2020-03-16": "Mar 2020 dash-for-cash",
+    "2023-03-13": "Mar 2023 SVB / regional bank run",
+    "2025-04-09": "Apr 2025 tariff shock basis unwind",
+    "2025-09-15": "Sep 2025 tax-date squeeze (SOFR +18bp over EFFR)",
+    "2025-12-31": "Dec 2025 year-end squeeze (SRF $74.6B record)",
+}
+
+# Competence boundary, stated honestly. ENDOGENOUS events build up inside the
+# funding plumbing (reserve scarcity, calendar settlement pressure) and leave a
+# trail Seiche can read weeks ahead. EXOGENOUS events arrive from outside it (a
+# pandemic, a single-bank run, a policy shock) and are NOT visible in the
+# plumbing beforehand — Seiche is structurally blind to them and says so. The
+# backtest reports recall split by class so the tool never claims to see what it
+# cannot.
+EPISODE_CLASS = {
+    "2019-09-17": "endogenous",   # reserve scarcity + quarter-end settlement
+    "2020-03-16": "exogenous",    # COVID shock, not a plumbing build-up
+    "2023-03-13": "exogenous",    # single-bank run (SVB), idiosyncratic
+    "2025-04-09": "exogenous",    # tariff policy shock, basis unwind
+    "2025-09-15": "endogenous",   # tax-date + reserve drain, calendar-driven
+    "2025-12-31": "endogenous",   # year-end squeeze, calendar-driven
+}
+ECHO_WINDOW = 30           # business days of trajectory to match
+ECHO_LEADS = range(0, 31)  # how many days before the episode the window ends
+
+# ---------------------------------------------------------------------------
+# CFTC TFF: Treasury futures contract constants for the RV X-Ray.
+# face: contract face value ($). dv01: rough per-contract dollar value of 1bp
+# (approximate CTD DV01s; transparent, tunable — these drive the margin-shock
+# simulator, not any displayed "size" number).
+# ---------------------------------------------------------------------------
+
+TFF_DATASET = "gpe5-46if"  # Traders in Financial Futures, futures-only (Socrata)
+
+UST_CONTRACTS = {
+    "UST 2Y NOTE":     {"face": 200_000, "dv01": 38.0},
+    "UST 5Y NOTE":     {"face": 100_000, "dv01": 43.0},
+    "UST 10Y NOTE":    {"face": 100_000, "dv01": 64.0},
+    "ULTRA UST 10Y":   {"face": 100_000, "dv01": 92.0},
+    "UST BOND":        {"face": 100_000, "dv01": 180.0},
+    "ULTRA UST BOND":  {"face": 100_000, "dv01": 265.0},
+}
+
+# Extra TFF contracts for the crowding panel (positioning z vs own history,
+# normalized by open interest — no DV01 needed). Exact upstream names
+# verified live 2026-07-07.
+CROWD_EXTRA_CONTRACTS = ["FED FUNDS", "SOFR-1M", "SOFR-3M", "E-MINI S&P 500"]
+CROWD_LOOKBACK_WEEKS = 156     # 3y window for crowding percentiles
+
+# ---------------------------------------------------------------------------
+# Liquidity Weather.
+# ---------------------------------------------------------------------------
+
+WEATHER_HORIZON_BDAYS = 42          # ~6 weeks
+CORPORATE_TAX_DAYS = {(3, 15), (4, 15), (6, 15), (9, 15), (12, 15)}
+# Reserve cushion (in $B) above the estimated kink at which we start flagging
+# crunch windows. Quarter-/year-end days get flagged at a wider cushion.
+CRUNCH_CUSHION_B = 150.0
+CRUNCH_CUSHION_QEND_B = 300.0
+# Auction settlements at/above this size ($B/day) get flagged on the path.
+SETTLEMENT_FLAG_B = 90.0
+
+# ---------------------------------------------------------------------------
+# Resonance Engine — the seiche made literal.
+# A seiche is a standing wave: the basin has resonant modes excited by
+# calendar forcing (month-end window dressing, quarter-end balance-sheet
+# snapshots, mid-month tax/settlement piles, year-end). We measure the
+# amplitude of the market's response to each recurring forcing event and,
+# critically, its TREND: a basin that rings louder to the same forcing is
+# losing damping — structural fragility rising while levels still look calm.
+# ---------------------------------------------------------------------------
+
+RESONANCE_MODES = ["month_end", "quarter_end", "year_end", "mid_month", "tax_date"]
+RESONANCE_PRE_BASELINE_D = 10   # business days before event for baseline median
+RESONANCE_WINDOW_D = 1          # +/- window around event to catch the slosh
+RESONANCE_DECAY_D = 5           # days after event over which decay is measured
+RESONANCE_RECENT_N = 6          # last-N vs prior-N events per mode for the trend
+RESONANCE_MIN_EVENTS = 6        # minimum events in a mode before we score it
+RESONANCE_AMP_SATURATION = 2.5  # recent/prior slosh ratio that maps to max score
+
+# ---------------------------------------------------------------------------
+# Hydrophone Array — how connected is the plumbing right now?
+# Absorption ratio (Kritzman): share of panel variance explained by the top
+# principal components of rolling standardized daily changes. Decoupled
+# segments absorb shocks; a densifying network transmits them.
+# ---------------------------------------------------------------------------
+
+HYDROPHONE_WINDOW_D = 120       # rolling window (business days)
+HYDROPHONE_TOP_PCS = 2          # top-K PCs in the absorption ratio
+HYDROPHONE_EDGE_MIN_ABS = 0.30  # min |lagged corr| to report a lead-lag edge
+HYDROPHONE_MAX_LAG_D = 3
+
+# ---------------------------------------------------------------------------
+# SONAR — daily anomaly sweep across every stored series.
+# Robust z = (last - trailing median) / (1.4826 * MAD). Flag |z| >= threshold
+# on level or 1d change; rank by max |z|.
+# ---------------------------------------------------------------------------
+
+SONAR_LOOKBACK_D = 250
+SONAR_Z_FLAG = 2.5
+SONAR_TOP_N = 12
+
+# ---------------------------------------------------------------------------
+# Turn Barometer — forecast the severity of the NEXT month/quarter-end turn.
+# Trained on history with leave-one-out CV; always reported against the naive
+# baseline (same-mode trailing median). If we can't beat naive, we SAY so.
+# ---------------------------------------------------------------------------
+
+TURN_FEATURE_LAG_D = 5          # features frozen T-5 before the turn
+TURN_MIN_HISTORY = 12           # minimum past turns before forecasting
+TURN_SEVERITY_BINS = [3.0, 6.0, 12.0, 20.0]   # bp cutoffs -> severity 1..5
+
+# ---------------------------------------------------------------------------
+# The Tell — plumbing-vs-price divergence. The whole thesis in one number:
+# plumbing percentile minus market-priced-stress percentile, -100..+100.
+# Positive = the basin is sloshing and the screens haven't noticed.
+# ---------------------------------------------------------------------------
+
+TELL_MARKET_WEIGHTS = {         # market-priced stress index components
+    "VIX": 0.35,
+    "HY_OAS": 0.30,
+    "IG_OAS": 0.15,
+    "RATES_VOL": 0.20,          # 10d realized vol of DGS10 daily changes (bp)
+}
+TELL_PERCENTILE_WINDOW_D = 750  # ~3y expanding-capped percentile basis
+TELL_ALERT_ABS = 30.0
+
+# ---------------------------------------------------------------------------
+# Playbook — state-conditioned forward outcome tables. NOT advice: honest
+# historical distributions with n shown, in native units.
+# ---------------------------------------------------------------------------
+
+PLAYBOOK_HORIZONS_BD = [5, 20]
+PLAYBOOK_OUTCOMES = {
+    # mnemonic -> (label, kind)  kind: "pct" = % return, "diff" = unit change
+    "SP500": ("S&P 500 return", "pct"),
+    "VIX": ("VIX change (pts)", "diff"),
+    "HY_OAS": ("HY OAS change (bp)", "diff_bp"),
+    "IG_OAS": ("IG OAS change (bp)", "diff_bp"),
+    "DGS10": ("10y yield change (bp)", "diff_bp"),
+    "DGS2": ("2y yield change (bp)", "diff_bp"),
+    "BTC_USD": ("BTC return", "pct"),
+}
+PLAYBOOK_MIN_N = 8              # below this sample size a cell renders as "n/a"
+
+# ---------------------------------------------------------------------------
+# Backtest lab (PROOF).
+# The historical index is rebuilt with EXPANDING-window standardization only
+# (no look-ahead in the z-scores) from non-revised market prints. Vintage
+# caveat: weekly H.4.1 aggregates are lightly revised; stated on the page.
+# ---------------------------------------------------------------------------
+
+BACKTEST_SPIKE_BP = 10.0        # "funding event" = SOFR-IORB jumps >= this vs t-1 median
+BACKTEST_EVENT_FWD_D = 5        # within this many business days
+BACKTEST_ALERT_PCTL = 80.0      # index percentile treated as an "alert"
+BACKTEST_MIN_WARMUP_D = 250     # expanding-z warmup before scoring starts
+
+# ---------------------------------------------------------------------------
+# Tide Tables — analog forecasting (the pattern layer made predictive).
+# k-nearest-neighbor over trailing state trajectories, all history, labeled
+# or not: publish what actually followed the closest matches (forward spread
+# fan + funding-event odds vs climatology), how charted today's water is
+# (novelty), and a walk-forward hindcast that says whether analogs beat the
+# base rate. Reported alongside the index, not weighted into it.
+# ---------------------------------------------------------------------------
+
+TIDE_WINDOW_D = 20          # trailing trajectory length (bd) to match on
+TIDE_K = 25                 # nearest analogs in the fan / odds
+TIDE_HORIZON_BD = 10        # forward fan length (bd)
+TIDE_EVENT_FWD_D = 5        # event-odds horizon — same as BACKTEST_EVENT_FWD_D
+TIDE_MIN_SEP_D = 10         # min bd between analog end dates (de-clustering)
+TIDE_WARMUP_D = 400         # scored history before the hindcast/novelty start
+TIDE_MIN_CANDIDATES = 60    # min candidate windows before the engine speaks
+TIDE_Z_MIN_PERIODS = 120    # expanding-z warmup (matches history MIN_Z_PERIODS)
+TIDE_NOVELTY_UNCHARTED = 90.0  # NN-distance pctl at/above which water is "uncharted"
+
+# ---------------------------------------------------------------------------
+# Undertow — the damping gauge (critical slowing down, Scheffer et al.).
+# Resonance measures the FORCED response to the calendar bell; Undertow
+# measures the FREE decay on ordinary days: rising lag-1 autocorrelation and
+# variance of the detrended spread/tail + lengthening recovery after everyday
+# pops = the basin losing damping while levels look calm. Expanding
+# percentiles only (no look-ahead); weighted into the composite as
+# structural-fragility evidence alongside resonance/hydrophone.
+# ---------------------------------------------------------------------------
+
+UNDERTOW_DETREND_D = 30          # rolling-median detrend window (bd)
+UNDERTOW_WINDOW_D = 120          # rolling window for AC1 / variance (bd)
+UNDERTOW_RECOVERY_CENSOR_D = 10  # recovery half-life censoring (bd)
+UNDERTOW_POP_DECLUSTER_BD = 5    # min bd between recovery pops (episode = 1 trial)
+UNDERTOW_RECOVERY_MIN_POPS = 8   # pops per era before the stretch counts
+UNDERTOW_MIN_HISTORY_D = 400     # refuse to speak below this
+
+# ---------------------------------------------------------------------------
+# Swell Forecast — the funding-stress forward curve. For each of the next 42
+# business days: P(spread pop >= x bp) from expanding calendar-bucket
+# exceedance distributions (the forcing schedule is public), a damping-state
+# lift (Undertow) and a coupon-settlement lift — compounded into P(event by
+# horizon) and walk-forward validated vs climatology. A forecast, not
+# evidence: reported alongside the index, never weighted in.
+# ---------------------------------------------------------------------------
+
+SWELL_SEVERITIES_BP = (2.0, 5.0, 10.0, 20.0)  # 10bp = the PROOF event
+SWELL_HORIZON_BD = 42            # matches Liquidity Weather's horizon
+SWELL_MIN_BUCKET_N = 20          # below this a bucket falls back to pooled
+SWELL_WARMUP_D = 500             # expanding-table warmup before scoring
+SWELL_STATE_PCTL = 67.0          # Undertow damping pctl at/above = "hot"
+SWELL_STATE_MIN_N = 60           # hot-state days before the lift activates
+SWELL_LIFT_CAP = (0.5, 3.0)      # conditional lifts clipped to this range
+SWELL_P_CAP = 0.90               # single-day probability ceiling
+
+# ---------------------------------------------------------------------------
+# Bathymetry — the shape of the basin floor: empirical Langevin/Fokker–Planck
+# reconstruction of the pop statistic's dynamics. Drift → effective potential
+# (the floor), transition-operator eigenvalues → the quantum-dual energy
+# spectrum and relaxation time, stationary currents → entropy production (the
+# arrow of time), absorbing-boundary first passage → P(event) and expected
+# days to the next event. Expanding counts only; fixed editorial bins.
+# A forecast/diagnosis layer — never weighted into the composite.
+# ---------------------------------------------------------------------------
+
+BATHY_X_MIN_BP = -8.0            # state-space floor edge (bp); below clips in
+BATHY_BIN_BP = 1.0               # fixed bin width (data-dependent bins would leak)
+BATHY_SHRINK_K = 15.0            # pseudo-count weight of the pooled increment kernel
+BATHY_BIN_MIN_N = 5              # bins thinner than this interpolate in the potential
+BATHY_WARMUP_D = 500             # transitions before the walk-forward speaks
+BATHY_SPECTRUM_EVERY_BD = 10     # spectral/entropy series recompute cadence
+BATHY_MFPT_CAP_BD = 750          # beyond ~3y the MFPT prints as "beyond horizon"
+
+# ---------------------------------------------------------------------------
+# Forecast-dispersion alert: when the Stack's calibrated members disagree,
+# the regime is ambiguous — that is a signal, not noise to average away.
+# ---------------------------------------------------------------------------
+
+STACK_DISPERSION_WARN = 0.30     # member std-dev that reads as ambiguity
+
+# ---------------------------------------------------------------------------
+# The Navigator — an LLM forecaster made accountable. One commitment per
+# data-day into the hash-chained record; NO backtest is possible for an LLM
+# member (it has read the history), so its forward record is its only
+# evidence and its weight stays zero until that record earns a hearing.
+# ---------------------------------------------------------------------------
+
+NAVIGATOR_MIN_RESOLVED = 20      # resolved forward forecasts before a verdict prints
+
+# ---------------------------------------------------------------------------
+# Riptide — the pop prognosis: the morning the spread pops, chop or current?
+# Unit of analysis = the declustered pop; discriminators = RRP co-sign,
+# calendar bucket, damping state. Speaks only when there is a live pop.
+# ---------------------------------------------------------------------------
+
+RIPTIDE_POP_BP = 4.0            # pop threshold (smallest turn-firming in every sample year)
+RIPTIDE_STICKY_MIN_BD = 3       # half-give-back at/after this = STICKY (a current)
+RIPTIDE_WINDOW_BD = 15          # sticky observation window
+RIPTIDE_ESCALATE_BD = 10        # horizon for escalation to a full PROOF event
+RIPTIDE_MIN_POPS = 30           # warmup pops before the walk-forward speaks
+RIPTIDE_LIVE_BD = 5             # a pop this recent makes the question live
+
+# ---------------------------------------------------------------------------
+# The Breakwater — the rescuer modeled. A dated catalog of Fed plumbing
+# interventions (public record; editorial dating flagged). Each is a
+# confession of where the reaction threshold sat that day. Zero fitted
+# parameters; append entries as history happens, never rewrite them.
+# ---------------------------------------------------------------------------
+
+BREAKWATER_INTERVENTIONS = [
+    {"date": "2019-09-17", "label": "ad-hoc overnight repo operations resume (first since 2008)",
+     "kind": "operations"},
+    {"date": "2019-10-11", "label": "T-bill purchases $60B/mo announced (reserve management)",
+     "kind": "purchases"},
+    {"date": "2020-03-15", "label": "QE restart, swap-line enhancement, discount-window cut",
+     "kind": "crisis package"},
+    {"date": "2021-07-28", "label": "Standing Repo Facility established",
+     "kind": "standing facility"},
+    {"date": "2023-03-12", "label": "Bank Term Funding Program (SVB weekend)",
+     "kind": "facility"},
+    {"date": "2024-06-01", "label": "QT taper: Treasury runoff cap $60B → $25B/mo",
+     "kind": "parameter", "dating": "effective date, editorial"},
+    {"date": "2025-12-01", "label": "QT ends",
+     "kind": "parameter"},
+    {"date": "2025-12-12", "label": "Reserve Management Purchases ~$40B/mo bills",
+     "kind": "purchases", "dating": "approximate, editorial"},
+]
+BREAKWATER_PROXIMITY_FLOOR_PCTL = 50.0   # below this percentile, proximity reads 0
+
+# ---------------------------------------------------------------------------
+# The physics layer (v2.6 "Bathysphere") — four engines that treat the basin
+# as the dynamical system it is named after. All of them are mathematics with
+# a pedigree (Fokker–Planck/Kramers, Koopman operator theory, Takens
+# embedding, extreme value theory), none of them are decoration: each one
+# publishes walk-forward evidence or expanding percentiles vs its own past,
+# under the same truncation-equality bar as everything else.
+# ---------------------------------------------------------------------------
+
+# Bathymetry lives in the forecast layer (see its block near Swell after the
+# v2.6 merge): its state variable is the PROOF event's own pop statistic, so
+# it is a forecast/diagnosis engine — never composite evidence.
+
+# Merian Modes — the seiche eigenmodes, estimated instead of assumed.
+# Merian's formula gives a real basin's standing-wave period from its
+# geometry; we go the other way and read the funding basin's actual modes
+# out of the data with Hankel-DMD (a finite-dimensional estimate of the
+# Koopman operator — classical dynamics in the Hilbert-space clothes of
+# Koopman–von Neumann mechanics). A mode with |λ| > 1 is a growing
+# oscillation: instability visible before levels move.
+MERIAN_WINDOW_D = 250          # trailing window per DMD fit (bd)
+MERIAN_DELAYS = 5              # Hankel (time-delay) embedding depth
+MERIAN_RANK_MAX = 8            # max SVD rank kept
+MERIAN_ENERGY = 0.90           # SVD energy cutoff
+MERIAN_MIN_SERIES = 4          # min panel series before the engine speaks
+MERIAN_MIN_HISTORY_D = 400
+MERIAN_SAMPLE_BD = 5           # instability-index sampling cadence (bd)
+MERIAN_PERIOD_BAND_BD = (4.0, 84.0)  # reported mode-period band
+MERIAN_TOP_MODES = 5
+
+# The Gyre — is prediction possible at all? Takens delay embedding +
+# empirical dynamic modeling (Sugihara): simplex-projection skill by horizon
+# (the determinism fingerprint — chaos decays, noise never had skill),
+# a phase-randomized surrogate gate, the S-map θ test for state-dependent
+# (nonlinear) dynamics, and the S-map Jacobian's local expansion rate as a
+# live stability gauge. Tide Tables asks WHICH history rhymes; the Gyre asks
+# whether the basin's dynamics are deterministic enough to rhyme at all.
+GYRE_DETREND_D = 30            # same residual as Undertow (comparability)
+GYRE_MIN_HISTORY_D = 600
+GYRE_EMBED_SCAN = (2, 8)       # embedding-dimension scan range (inclusive)
+GYRE_HORIZONS_BD = (1, 2, 3, 5, 8, 13, 21)
+GYRE_THETAS = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0)
+GYRE_WARMUP_D = 500            # library-only warmup before hindcast scoring
+GYRE_MIN_LIB = 300             # min library vectors before a prediction
+GYRE_SURROGATES = 20           # phase-randomized surrogates (determinism gate)
+GYRE_SEED = 7                  # surrogate rng seed — the board is deterministic
+
+# Rogue Wave — the tail law. Peaks-over-threshold GPD (probability-weighted
+# moments — no distributional hand-waving, CIs printed) on the SAME
+# declustered pop statistic as PROOF. The empirical exceedance curves the
+# Swell uses stop dead at the largest pop ever seen; the GPD is the honest
+# instrument for the wave that is NOT in the sample yet — return levels and
+# P(pop ≥ x) beyond history, with the uncertainty stated.
+ROGUE_DECLUSTER_BD = 5         # an episode is one wave (same rule as PROOF)
+ROGUE_THRESHOLD_PCTL = 80.0    # GPD threshold: expanding pctl of declustered pops
+ROGUE_MIN_EXCEED = 40          # min exceedances before a fit prints
+ROGUE_MIN_HISTORY_D = 500
+ROGUE_RETURN_YEARS = (1.0, 5.0, 10.0)
+ROGUE_SEVERITIES_BP = (10.0, 15.0, 25.0, 35.0)  # P(pop ≥ x within h)
+ROGUE_HORIZONS_BD = (5, 21, 63)
+ROGUE_BOOT_N = 400             # bootstrap reps for the CIs (fixed seed)
+ROGUE_SEED = 7
+ROGUE_SENS_PCTLS = (70.0, 80.0, 85.0, 90.0)  # threshold-sensitivity table
+
+# Microseism — the shock catalog (IDEAS.md #13). Calendar-gated Hawkes on
+# the SHARED pop statistic: micro-shocks >= MICRO_POP_BP (not declustered —
+# clustering IS the signal), baseline = expanding calendar-bucket rates
+# (Swell's classify_days, shrunk by MICRO_SHRINK_K pseudo-days), branching
+# ratio n = expected aftershocks per shock, watched toward the n=1
+# criticality boundary. Must beat the calendar-Poisson null (LR test) and
+# calendar climatology walk-forward, or it self-demotes to diagnostic.
+MICRO_POP_BP = 2.0               # micro-shock threshold on the pop statistic
+MICRO_SENS_BP = (1.5, 3.0)       # sensitivity thresholds published alongside
+MICRO_SHRINK_K = 10.0            # pseudo-days shrinking thin buckets to pooled
+MICRO_MIN_EVENTS = 60            # shocks before any fit prints
+MICRO_MIN_HISTORY_D = 500        # refuse to speak below this
+MICRO_REFIT_EVERY_BD = 63        # branching-history / walk-forward refit cadence
+MICRO_HAZARD_FWD_BD = 5          # hazard horizon — same as BACKTEST_EVENT_FWD_D
+MICRO_NEAR_CRITICAL = 0.7        # branching at/above this reads near-critical
+
+# Thermohaline — the deep circulation. BIS global-liquidity aggregates read
+# as the slow, planet-scale layer under the daily plumbing: the offshore
+# dollar-credit stock, its growth percentile vs its own quarter-century
+# history, and the credit-to-GDP gaps. Quarterly + lagged by design — context
+# ONLY, never composite (a two-quarter-old number cannot evidence stress today).
+THERMO_MIN_OBS = 24              # >= 6y of quarterly history before percentiles speak
+THERMO_HOT_PCTL = 80.0           # yoy-growth expanding pctl at/above = "accelerating"
+
+# Regatta — the fleet raced honestly. Model Confidence Set (Hansen-Lunde-Nason)
+# over the daily Brier losses of every forecast member + the published stack +
+# calendar climatology: which boats are statistically indistinguishable from
+# the leader, snoop-corrected. The MCS answers the objection PROOF's
+# per-engine nulls cannot: "with this many engines, one HAD to look good."
+REGATTA_MCS_SIZE = 0.10          # models kept while MCS p-value >= this
+REGATTA_REPS = 1000              # bootstrap replications
+REGATTA_BLOCK_BD = 21            # block size (losses are serially correlated)
+REGATTA_SEED = 7
+REGATTA_MIN_ROWS = 300           # common scored days before the race prints
+
+# Sea Room — adaptive conformal coverage (Gibbs-Candès ACI) on the published
+# fleet probability. Venn-Abers calibrates the number; Sea Room guarantees
+# the COVERAGE: a daily prediction set over {event, no-event} whose long-run
+# miscoverage tracks SEAROOM_ALPHA even under regime drift. Feedback is
+# honestly delayed: a day's label joins the score pool only after its 5bd
+# window closes.
+SEAROOM_ALPHA = 0.10             # target miscoverage (90% coverage sets)
+SEAROOM_GAMMA = 0.01             # ACI step size
+SEAROOM_WARMUP = 250             # resolved scores before sets are emitted
+
+# Sea State — the marine regime scale, estimated not asserted. A 2-state
+# Gaussian hidden Markov model (hand-rolled Hamilton filter + EM, no new
+# deps) on the detrended spread residual publishes FILTERED P(rough water)
+# — strictly causal, refit at deterministic positions, and walk-forward
+# scored against climatology like every other forecast layer.
+SEASTATE_DETREND_D = 30          # same residual as Undertow (comparability)
+SEASTATE_MIN_HISTORY_D = 600
+SEASTATE_REFIT_EVERY_BD = 126    # prefix refits (EM is heavier than a z-score)
+SEASTATE_EM_ITERS = 80           # EM iteration cap (tol-gated below that)
+SEASTATE_WARMUP_D = 600          # scored history before the hindcast speaks
+
+# Leak Audit — the one-switch leakage protocol (arXiv:2605.23959) applied to
+# Seiche's own pipeline: rebuild the lite index with exactly ONE discipline
+# deliberately broken (global-sample z, centered smoothing, self-fitted alert
+# threshold) and publish the Leakage Gain each break would buy. A clean
+# pipeline shows the gains it REFUSES to claim; the audit is the evidence
+# that the expanding-window discipline is load-bearing, not decoration.
+LEAKAUDIT_TEMP_CENTER_W = 5      # centered-window width for the TEMP_CENTER toggle
+LEAKAUDIT_THRESH_GRID = tuple(float(x) for x in range(50, 99, 2))  # THRESH_FIT scan
+
+# ---------------------------------------------------------------------------
+# ML Lab. Same event definition as the backtest; the model must beat BOTH
+# climatology and the rule-based index out-of-sample or it says so. Trailing-
+# only features, walk-forward refits — no shuffled CV (that's leakage on
+# time series), no test-set peeking.
+# ---------------------------------------------------------------------------
+
+ML_WARMUP_D = 500               # days of history before the first OOS prediction
+ML_REFIT_EVERY_BD = 42          # walk-forward refit cadence (~2 months)
+ML_PROB_ALERT = 0.5             # alert when P(event within 5bd) crosses this
+
+# ---------------------------------------------------------------------------
+# The Stack — walk-forward ensemble of the three P(event) streams + The Tell.
+# Fleet doctrine: the fitted stack must beat the zero-parameter equal-weight
+# mean of its members out-of-sample or the mean is published instead (same
+# publish-naive rule as the Turn Barometer). Member disagreement (dispersion)
+# is itself an output: when the fleet splits, conviction drops.
+# ---------------------------------------------------------------------------
+
+STACK_WARMUP_D = 250            # scored member history before the first OOS stack print
+STACK_REFIT_EVERY_BD = 42       # same cadence as ML_REFIT_EVERY_BD
+STACK_L2_C = 1.0                # logistic regularization, fixed — never fitted to OOS
+STACK_MIN_MEMBERS = 2           # a row is scored only with >= this many live members
+
+# ---------------------------------------------------------------------------
+# The Book (HELM tab) — the signal made accountable: explicit daily positions
+# on a small liquid universe, walk-forward P&L with costs, and an accruing
+# hash-chained as-published record. PAPER PROXY, stated everywhere: duration
+# sleeves are constant-maturity par-yield approximations (carry + duration +
+# convexity), not tradeable futures; close-to-close only; not investment advice.
+# Every constant here is editorial, frozen, and disclosed.
+# ---------------------------------------------------------------------------
+
+BOOK_SLEEVES = {
+    # duration proxies: r ≈ y/252 (carry) − D·Δy + ½·C·Δy²; D/C are rough
+    # constant-maturity values — the approximation is printed, not hidden.
+    "ust2y":  {"proxy": "DGS2",    "kind": "duration", "mod_dur": 1.90, "convexity": 4.5,  "tcost_bp": 1.0,  "label": "2y UST duration"},
+    "ust10y": {"proxy": "DGS10",   "kind": "duration", "mod_dur": 7.90, "convexity": 70.0, "tcost_bp": 2.0,  "label": "10y UST duration"},
+    "spx":    {"proxy": "SP500",   "kind": "price",    "tcost_bp": 3.0,  "label": "S&P 500"},
+    "btc":    {"proxy": "BTC_USD", "kind": "price",    "tcost_bp": 15.0, "label": "Bitcoin"},
+}
+BOOK_CASH_PROXY = "TB3M"        # cash accrual y/252 (discount-rate convention, stated)
+# Direction per sleeve per stance. Economic prior (funding stress = risk-off,
+# flight-to-quality bid for the front end), cross-checked against the PROOF
+# outcome tables and FROZEN — changing these reruns history, and the caveat
+# that they were chosen knowing that history is printed verbatim.
+BOOK_STANCE_MAP = {
+    "risk_off": {"ust2y": 1.0, "ust10y": 0.5, "spx": -1.0, "btc": -0.5},
+    "risk_on":  {"ust2y": 0.0, "ust10y": 0.0, "spx": 1.0,  "btc": 0.5},
+    "neutral":  {"ust2y": 0.0, "ust10y": 0.0, "spx": 0.0,  "btc": 0.0},
+}
+BOOK_P_ENTER_RISKOFF = 0.35     # hysteresis: enter high…
+BOOK_P_EXIT_RISKOFF = 0.22      # …exit lower (turnover control)
+BOOK_P_RISKON = 0.08            # risk_on needs quiet plumbing AND price panicking:
+BOOK_TELL_RISKON = -15.0        # Tell <= this (price leads plumbing)
+BOOK_DISPERSION_GATE = 0.25     # member-prob std above this forces neutral
+BOOK_VOL_TARGET_ANN = 0.10      # per-sleeve annualized vol target
+BOOK_VOL_LOOKBACK_D = 63
+BOOK_VOL_MIN_PERIODS = 21
+BOOK_MAX_WEIGHT = 1.0           # per-sleeve |w| cap
+BOOK_MAX_GROSS = 2.0            # Σ|w| cap (proportional scale-down)
+BOOK_SIGNAL_LAG_BD = 1          # weights formed at t earn returns at t+1
+BOOK_BENCH_STATIC = {"ust2y": 0.20, "ust10y": 0.15, "spx": 0.50, "btc": 0.05}
+BOOK_BOOT_BLOCK_D = 21          # stationary block bootstrap for the Sharpe CI
+BOOK_BOOT_N = 2000
+BOOK_LIVE_MIN_D = 60            # live Sharpe printed only past this many as-published days
+
+# ---------------------------------------------------------------------------
+# Far Basin — Palimpsest (palimpsest.info): the policy-fear channel. What the
+# Chinese state rushes to delete is a real-time stress read no market vendor
+# carries. Keyless CI-published JSON; palimpsest.info primary with the GitHub
+# raw mirror as fallback. HONEST SCOPE: the feeds are days old as a public
+# series — they accrue in the local store and are labeled NOT YET BACKTESTABLE
+# until they clear FARBASIN_MIN_OBS. Never weighted into the composite.
+# ---------------------------------------------------------------------------
+
+PALIMPSEST_BASES = [
+    "https://palimpsest.info/readings",
+]
+PALIMPSEST_TTL_MIN = 240
+FARBASIN_MIN_OBS = 250          # daily obs before the channel may enter any model
+
+PALIMPSEST_SERIES = [
+    SeriesSpec("PALIMPSEST_FEAR", "palimpsest", "ddti-history.jsonl:top_threat",
+               "Censor deletion-threat (top-term threat score)", "score", "D", PALIMPSEST_TTL_MIN),
+    SeriesSpec("PALIMPSEST_NEW", "palimpsest", "ddti-history.jsonl:n_new",
+               "Newly censor-targeted terms", "terms", "D", PALIMPSEST_TTL_MIN),
+    SeriesSpec("PALIMPSEST_GFI", "palimpsest", "history.jsonl:gfi",
+               "Generative Firewall Index (LLM refusal tomography)", "0-100", "D", PALIMPSEST_TTL_MIN),
+]
+ALL_SERIES.update({s.mnemonic: s for s in PALIMPSEST_SERIES})
+
+# ---------------------------------------------------------------------------
+# FOMC calendar (static; update annually from federalreserve.gov —
+# verified 2026-07-07). Dates are the DECISION day (second meeting day).
+# ---------------------------------------------------------------------------
+
+FOMC_DECISION_DATES = [
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+]
+
+# ---------------------------------------------------------------------------
+# Communiqué — the policy text read as plumbing data. Statement dates back to
+# 2023 (decision day; the statement URL keys off this date). The lexicons are
+# FROZEN opinions: a scorer that drifts cannot sit under a vintage-stamped
+# record. Tune by appending, never by rewriting history's scores.
+# URL pattern unverified-live from the build container — collector fails
+# loud per date and coverage prints on the board.
+# ---------------------------------------------------------------------------
+
+FOMC_STATEMENT_DATES = [
+    "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14",
+    "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13",
+    "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12",
+    "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
+    "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+] + FOMC_DECISION_DATES
+FEDTEXT_TTL_MIN = 24 * 60          # re-check for a new statement daily
+
+COMMUNIQUE_LEXICON_HAWKISH = (
+    "inflation remains elevated", "further tightening", "restrictive",
+    "raise the target range", "upside risks to inflation", "vigilant",
+    "additional firming",
+)
+COMMUNIQUE_LEXICON_DOVISH = (
+    "lower the target range", "accommodative", "downside risks", "easing",
+    "has softened", "cooled", "well anchored",
+)
+COMMUNIQUE_LEXICON_BS_TIGHT = (
+    "reduce its holdings", "runoff", "balance sheet reduction",
+    "redemption of Treasury securities",
+)
+COMMUNIQUE_LEXICON_BS_EASE = (
+    "purchases of Treasury securities", "reinvesting", "increase its holdings",
+    "reserve management purchases",
+)
+COMMUNIQUE_LEXICON_STRESS = (
+    "money market", "repurchase agreement", "funding pressures",
+    "market functioning", "liquidity strains", "standing repo facility",
+)
+
+# ---------------------------------------------------------------------------
+# Seiche Index: composite weights and regime thresholds.
+# TUNING POINT — this is the tool's editorial voice. Weights sum to 1.
+# Rationale for defaults: tails + spreads are the fastest-moving true signals
+# (every 2025/26 episode), kink/weather capture the structural runway,
+# confession channels (SRF + discount window) are slower but unambiguous,
+# resonance/hydrophone/undertow capture structural fragility invisible in
+# levels (forced response, connectivity, free decay), positioning/auctions/
+# warehouse are amplifier terms, buffers the absorber.
+# ---------------------------------------------------------------------------
+
+COMPOSITE_WEIGHTS = {
+    "tails": 0.17,        # Tail Seismograph (incl. SOFR-IORB pressure)
+    "kink": 0.13,         # proximity to reserve-scarcity kink
+    "weather": 0.11,      # forward crunch-window risk
+    "confession": 0.12,   # SRF usage + discount window (paying up = admission)
+    "rvxray": 0.11,       # RV complex size/fragility
+    "resonance": 0.10,    # basin amplification (louder ring to same forcing)
+    "hydrophone": 0.08,   # plumbing connectivity (shock transmission)
+    "undertow": 0.06,     # damping loss (slower free decay = critical slowing)
+    "auctions": 0.06,     # supply digestion
+    "warehouse": 0.03,    # dealer balance-sheet saturation
+    "buffers": 0.03,      # RRP buffer emptiness (0 = no shock absorber left)
+}
+# v2.6 note: NONE of the physics engines join the composite. Bathymetry's
+# state variable is the PROOF event's own pop statistic (forecast layer, its
+# escape probability joins the Stack instead); Merian, Gyre and Rogue Wave
+# are amplifier/forecast context, not stress evidence — the same doctrine
+# that keeps Echo and Tell out. The composite stays a nowcast.
+
+REGIMES = [
+    (25.0, "CALM"),
+    (45.0, "EROSION"),
+    (70.0, "STRAIN"),
+    (100.1, "STRESS"),
+]
+
+# Echo similarity and The Tell are reported alongside the index but not
+# weighted into it: resemblance is context, divergence is a trading signal —
+# neither is *evidence of stress* by itself. (Change of opinion welcome —
+# add a weight above and wire engines/composite.py.)
+
+# ---------------------------------------------------------------------------
+# Alert rules (CLI `seiche alert` / `seiche watch`). Each rule fires once per
+# distinct state (deduped via sqlite alert log), fail-loud on engine faults.
+# ---------------------------------------------------------------------------
+
+ALERT_RULES = {
+    "regime_change": True,          # any regime transition
+    "index_jump_5d": 8.0,           # composite +8 pts in 5 days
+    "tail_z": 2.0,                  # blended tail z crosses this
+    "srf_accepted_b": 5.0,          # any SRF take-up >= $5B
+    "discount_window_b": 10.0,      # DW primary credit >= $10B
+    "tell_abs": TELL_ALERT_ABS,     # |Tell| crosses threshold
+    "crunch_within_d": 10,          # crunch window enters this horizon
+    "turn_severity": 4,             # forecast turn severity >= this (1..5)
+    "swap_line_usd_m": 1000.0,      # USD swap-line ops, 30d total >= $1B
+    "peg_dev_bp": PEG_DEV_FLAG_BP,  # any major stablecoin |peg dev| >= this
+    "stable_drain_30d_pct": STABLE_DRAIN_FLAG_PCT,  # offshore dollar redemptions
+    "ml_event_prob": ML_PROB_ALERT, # ML Lab P(funding event, 5bd) >= this
+    "analog_event_odds": 0.5,       # Tide Tables share of analogs hit within 5bd
+    "swell_event_prob": 0.5,        # Swell curve P(event within 5bd) >= this
+    "bathymetry_event_prob": 0.5,   # first-passage P(event within 5bd) >= this
+    "stack_dispersion": STACK_DISPERSION_WARN,  # member dispersion reads as ambiguity
+    "riptide_sticky": 0.6,          # live pop classified as a current
+    "breakwater_proximity": 90.0,   # board near historical rescue conditions
+    "merian_instability": 95.0,     # growing-mode index percentile >= this
+    "microseism_branching": MICRO_NEAR_CRITICAL,  # aftershock chain near-critical (LR-identified)
+    "pit_gap_bd": 3,                # dead-man: >= this many consecutive bd missing from the PIT record
+    "book_flip": True,              # the Book changed stance/positions
+    "engine_dead": True,            # any composite input DEAD
+}
+ALERT_WEBHOOK_ENV = "SEICHE_WEBHOOK_URL"   # optional POST target (Slack/TG/...)
+
+# ---------------------------------------------------------------------------
+# MCP metering (the hosted /mcp endpoint for AI agents). Anonymous callers get
+# the free public tools and a tight daily cap so agent-builders can try Seiche
+# with zero friction; subscribers authenticate with the same bearer token as
+# the API and get per-tier daily quotas. None = unlimited. These are the
+# commercial dials — tune them here.
+# ---------------------------------------------------------------------------
+
+MCP_DAILY_QUOTAS = {          # tool-calls per UTC day, by subscriber tier
+    "pro": 5000,
+    "founder": None,          # unlimited
+    "enterprise": None,       # unlimited
+}
+MCP_ANON_DAILY = 200          # tool-calls per UTC day for an unauthenticated IP
+MCP_RATE_LIMIT_PER_MIN = 60   # per-caller burst ceiling (IP or username)
+MCP_MAX_BATCH = 25            # max JSON-RPC messages in one /mcp POST (anti-abuse)
+MCP_UPGRADE_URL = "https://seiche.info/support.html"  # shown when a quota is hit
+
+# Tiers a paid subscription can be provisioned into (see provisioning.py). A
+# tier here must have a quota entry above (or be unlimited by omission).
+SUBSCRIBER_TIERS = ("pro", "founder", "enterprise")
