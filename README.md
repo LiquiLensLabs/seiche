@@ -237,7 +237,7 @@ that no reconstruction can be accused of polishing. Not investment advice.
 Seiche is a whole terminal, but most of it is built from parts that stand on
 their own. If you are building anything that turns messy public data into a
 claim you have to defend later, you can lift these pieces without adopting the
-rest of the board.
+rest of the board. Worked, copy-paste examples are in [REUSE.md](REUSE.md).
 
 - **The as-published ledger.** Every daily forecast is sealed into a
   tamper-evident, hash-chained record the day it is made, and the misses stay
