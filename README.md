@@ -232,6 +232,38 @@ aggregates are lightly revised; the caveat is printed on the PROOF page). From v
 onward Seiche also accrues a true as-published point-in-time record (`/api/pit`)
 that no reconstruction can be accused of polishing. Not investment advice.
 
+## Reusable open infrastructure
+
+Seiche is a whole terminal, but most of it is built from parts that stand on
+their own. If you are building anything that turns messy public data into a
+claim you have to defend later, you can lift these pieces without adopting the
+rest of the board.
+
+- **The as-published ledger.** Every daily forecast is sealed into a
+  tamper-evident, hash-chained record the day it is made, and the misses stay
+  published next to the hits. This is a general pattern for any project that
+  makes public predictions and wants them to be auditable rather than quietly
+  editable. A forecasting, civic data or research integrity effort can reuse it
+  as is.
+- **The look-ahead guard.** A test in the suite mechanically forbids future data
+  from leaking into a backtest, and every engine validates walk-forward against a
+  naive benchmark and prints the verdict even when it loses. The harness does not
+  care about the subject: point it at epidemiology, elections, climate or your own
+  series.
+- **Keyless public data clients.** Ready connectors for FRED, NY Fed Markets, OFR
+  STFM, Treasury FiscalData, CFTC, ECB Data Portal, DeFiLlama and Coinbase, all
+  free and none needing an API key. If your project touches any of these sources,
+  the client is already written and tested.
+- **The fusion scaffolding.** A framework for combining many weak public signals
+  into one auditable read, with every judgment call (weights, thresholds, rules)
+  quarantined in a single config file so the math never hides an opinion. It is a
+  starting point for building your own monitoring board on a different subject.
+- **Agent access.** An MCP server exposes the whole board to AI agents and other
+  tools. See [docs/MCP.md](docs/MCP.md).
+
+All of it is AGPL, so anything you build on these parts stays open the same way.
+If you reuse a piece and it helps, a note back is welcome but never required.
+
 ## License
 
 Seiche is free software, released under the GNU Affero General Public License v3.0 or later
